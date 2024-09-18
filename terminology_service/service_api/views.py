@@ -8,7 +8,12 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 
 from .models import Directory, DirectoryElement, VersionDirectory
-from .serializers import DirectorySerializer, DirectoryElementSerializer
+from .serializers import (
+    DirectorySerializer,
+    DirectoryElementSerializer,
+    DateSerializer,
+    CheckSerializer,
+)
 from .documentations import (
     directory_docs,
     directory_element_docs,
@@ -23,53 +28,42 @@ def page_not_fount(request, exception):
 
 class DirectoryView(GenericAPIView):
     """ Endpoint for getting a list of reference books for a given date """
-    queryset = (
-        Directory.objects
-        .prefetch_related("versions")
-        .values("id", "code", "name")
-        .distinct()
-    )
-    serializer_class = DirectorySerializer
-
     @directory_docs
     def get(self, request: Request, *args, **kwargs) -> Response:
         try:
-            get_date = request.query_params.dict().get("date")
+            query = Directory.objects.prefetch_related("versions") \
+                .values("id", "code", "name") \
+                .distinct()
 
-            if get_date:
-                year, month, day = get_date.split("-")
-                date_obj = Date(int(year), int(month), int(day))
-                result = self.get_queryset().filter(versions__created_date__lte=date_obj)
-            else:
-                result = self.get_queryset()
+            if request.query_params.dict().get("date"):
+                serializer = DateSerializer(request.query_params.dict())
 
-            return Response({"refbooks": result.all()})
+                if serializer.is_valid():
+                    query = query.filter(
+                        versions__created_date__lte=serializer.validated_data.get("date")
+                    )
+
+            return Response({"refbooks": DirectorySerializer(query, many=True).data})
         except Exception as e:
             return Response({"error": str(e)}, 404)
 
 
 class DirectoryElementView(GenericAPIView):
     """ Endpoint for getting a specific directory item """
-    preloaded = Prefetch(
-        "version_directory",
-        queryset=VersionDirectory.objects.select_related("directory")
-    )
-    queryset = (
-        DirectoryElement.objects
-        .prefetch_related(preloaded)
-        .values("code", "value")
-        .distinct()
-    )
-    serializer_class = DirectoryElementSerializer
-
     @directory_element_docs
     def get(self, request: Request, *args, **kwargs) -> Response:
         try:
             directory_id = int(kwargs.get("id"))
             version = request.query_params.dict().get("version")
-            query = self.get_queryset().filter(
-                version_directory__directory__id=directory_id
+
+            preloaded = Prefetch(
+                "version_directory",
+                queryset=VersionDirectory.objects.select_related("directory")
             )
+            query = DirectoryElement.objects.prefetch_related(preloaded) \
+                .values("code", "value") \
+                .distinct() \
+                .filter(version_directory__directory__id=directory_id)
 
             if version:
                 result = query.filter(version_directory__version=version)
@@ -87,50 +81,52 @@ class DirectoryElementView(GenericAPIView):
                     version_directory__created_date=max_date_subquery
                 )
 
-            return Response({"elements": result.all()})
+            return Response({
+                "elements": DirectoryElementSerializer(result.all(), many=True).data
+            })
         except Exception as e:
             return Response({"error": str(e)}, 404)
 
 
 class DirectoryCheckView(GenericAPIView):
     """ Endpoint for checking if a directory element exists in the database """
-    preloaded = Prefetch(
-        "version_directory",
-        queryset=VersionDirectory.objects.select_related("directory")
-    )
-    queryset = (
-        DirectoryElement.objects
-        .prefetch_related(preloaded)
-        .distinct()
-    )
-
     @directory_check_docs
     def get(self, request: Request, *args, **kwargs) -> Response:
         try:
             directory_id = int(kwargs.get("id"))
-            code, value, version = request.query_params.dict().values()
-            query = self.get_queryset().filter(
-                version_directory__directory__id=directory_id,
-                code=code,
-                value=value,
-            )
 
-            if version:
-                result = query.filter(version_directory__version=version)
-            else:
-                today = date.today()
+            serializer = CheckSerializer(data=request.query_params.dict())
 
-                max_date_subquery = Subquery(
-                    VersionDirectory.objects
-                    .filter(directory_id=directory_id, created_date__lte=today)
-                    .values('created_date')
-                    .annotate(max_date=Max('created_date'))
-                    .values('max_date')[:1]
+            if serializer.is_valid():
+                preloaded = Prefetch(
+                    "version_directory",
+                    queryset=VersionDirectory.objects.select_related("directory")
                 )
-                result = query.filter(
-                    version_directory__created_date=max_date_subquery
+                query = DirectoryElement.objects.prefetch_related(preloaded).distinct() \
+                    .filter(
+                    version_directory__directory__id=directory_id,
+                    code=serializer.validated_data.get("code"),
+                    value=serializer.validated_data.get("value"),
                 )
 
-            return Response({"exists": bool(result.exists())})
+                if serializer.validated_data.get("version"):
+                    result = query.filter(
+                        version_directory__version=serializer.validated_data.get("version")
+                    )
+                else:
+                    today = date.today()
+
+                    max_date_subquery = Subquery(
+                        VersionDirectory.objects
+                        .filter(directory_id=directory_id, created_date__lte=today)
+                        .values('created_date')
+                        .annotate(max_date=Max('created_date'))
+                        .values('max_date')[:1]
+                    )
+                    result = query.filter(
+                        version_directory__created_date=max_date_subquery
+                    )
+
+                return Response({"exists": bool(result.exists())})
         except Exception as e:
             return Response({"error": str(e)}, 404)
